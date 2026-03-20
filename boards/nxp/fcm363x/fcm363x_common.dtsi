@@ -72,7 +72,7 @@
 	xm25qh64d: xm25qh64d@0 {
 		compatible = "nxp,imx-flexspi-nor";
 		reg = <0>;
-		size = <DT_SIZE_M(8)>;
+		size = <DT_SIZE_M(8*8)>;
 		status = "okay";
 		jedec-id = [20 40 17];
 		erase-block-size = <4096>;
