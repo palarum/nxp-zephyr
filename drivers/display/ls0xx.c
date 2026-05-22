@@ -311,20 +311,14 @@ static int ls0xx_update_display(const struct device *dev,
 static void rotate180_a1(const uint8_t *src, uint8_t *dst, int32_t width, int32_t height)
 {
 	int32_t line_bytes = width / 8;
+        const uint8_t *src_line = src;
+        uint8_t *dst_line = dst + (height - 1) * line_bytes;
 	for (int32_t y = 0; y < height; y++) {
-		const uint8_t *src_line = src + y * line_bytes;
-		uint8_t *dst_line = dst + (height - 1 - y) * line_bytes;
 		for (int32_t x = 0; x < line_bytes; x++) {
-			uint8_t b = src_line[x];
-			/* Bit reversal for 180 degree rotation within a byte.
-			 * This effectively swaps bits 0<->7, 1<->6, 2<->5, 3<->4.
-			 */
-			b = ((b & 0xF0) >> 4) | ((b & 0x0F) << 4);
-			b = ((b & 0xCC) >> 2) | ((b & 0x33) << 2);
-			b = ((b & 0xAA) >> 1) | ((b & 0x55) << 1);
-			/* Place the bit-reversed byte at the opposite end of the destination line. */
-			dst_line[line_bytes - 1 - x] = b;
+		        dst_line[line_bytes - 1 - x] = ((uint8_t)__RBIT(src_line[x]) >> 24);
 		}
+        src_line += line_bytes;
+		dst_line -= line_bytes;
 	}
 }
 
