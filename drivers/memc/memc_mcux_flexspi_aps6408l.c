@@ -297,7 +297,7 @@ static int memc_flexspi_aps6408l_init(const struct device *dev)
 				DT_INST_PROP(n, ahb_write_wait_unit)),	\
 		.AHBWriteWaitInterval =					\
 			DT_INST_PROP(n, ahb_write_wait_interval),	\
-		.enableWriteMask = true,				\
+		.enableWriteMask = false,				\
 	}								\
 
 #define MEMC_FLEXSPI_APS6408L(n)				  \

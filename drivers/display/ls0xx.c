@@ -315,7 +315,7 @@ static void rotate180_a1(const uint8_t *src, uint8_t *dst, int32_t width, int32_
         uint8_t *dst_line = dst + (height - 1) * line_bytes;
 	for (int32_t y = 0; y < height; y++) {
 		for (int32_t x = 0; x < line_bytes; x++) {
-		        dst_line[line_bytes - 1 - x] = ((uint8_t)__RBIT(src_line[x]) >> 24);
+		        dst_line[line_bytes - 1 - x] = (uint8_t)(__RBIT(src_line[x]) >> 24);
 		}
         src_line += line_bytes;
 		dst_line -= line_bytes;

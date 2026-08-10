@@ -22,10 +22,10 @@
 
 	chosen {
 		zephyr,sram = &sram_data;
-		zephyr,flash = &w25q512jvfiq;
+		zephyr,flash = &w25q128jw;
 		zephyr,console = &flexcomm3;
 		zephyr,shell-uart = &flexcomm3;
-		zephyr,flash-controller = &w25q512jvfiq;
+		zephyr,flash-controller = &w25q128jw;
 		zephyr,code-partition = &slot0_partition;
 		zephyr,uart-mcumgr = &flexcomm3;
 	};
@@ -95,13 +95,15 @@
 	ahb-boundary = "1024";
 	rx-clock-source = <1>;
 	rx-clock-source-b = <1>;
-	/* Winbond external flash */
-	w25q512jvfiq: w25q512jvfiq@0 {
+	/* Winbond W25Q128JW — 16 MB (128 Mbit) 1.8 V QSPI NOR (Murata Type 2FR).
+	 * jedec-id ef 60 18: the 0x60 memory-type byte is the 1.8 V "JW" part
+	 * (0x40 would be the 3.3 V "JV"). Matches nxp/mimxrt1180_evk. */
+	w25q128jw: w25q128jw@0 {
 		compatible = "nxp,imx-flexspi-nor";
 		reg = <0>;
-		size = <DT_SIZE_M(64 * 8)>;
+		size = <DT_SIZE_M(16 * 8)>;
 		status = "okay";
-		jedec-id = [ef 40 20];
+		jedec-id = [ef 60 18];
 		erase-block-size = <4096>;
 		write-block-size = <1>;
 		spi-max-frequency = <104000000>;
@@ -112,8 +114,11 @@
 			#size-cells = <1>;
 
 			/*
-			 * Partition sizes must be aligned
-			 * to the flash security sub-region size of 128KB.
+			 * 16 MB non-TrustZone layout. Sizes 128 KB-aligned (flash
+			 * security sub-region). 4 MB app slots give a ~2 MB image OTA
+			 * headroom; the rest is storage. This drops the stock
+			 * secure/non-secure split, so frdm_rw612//ns (TF-M) is not
+			 * supported with this flash without its own partition fix.
 			 */
 			boot_partition: partition@0 {
 				label = "mcuboot";
@@ -121,23 +126,15 @@
 			};
 			slot0_partition: partition@20000 {
 				label = "image-0";
-				reg = <0x00020000 DT_SIZE_K(640)>;
+				reg = <0x00020000 DT_SIZE_M(4)>;
 			};
-			slot0_ns_partition: partition@C0000 {
-				label = "image-0-non-secure";
-				reg = <0x000C0000 DT_SIZE_M(3)>;
-			};
-			slot1_partition: partition@3C0000 {
+			slot1_partition: partition@420000 {
 				label = "image-1";
-				reg = <0x003C0000 DT_SIZE_K(640)>;
+				reg = <0x00420000 DT_SIZE_M(4)>;
 			};
-			slot1_ns_partition: partition@460000 {
-				label = "image-1-non-secure";
-				reg = <0x00460000 DT_SIZE_M(3)>;
-			};
-			storage_partition: partition@760000 {
+			storage_partition: partition@820000 {
 				label = "storage";
-				reg = <0x00760000 (DT_SIZE_M(57) - DT_SIZE_K(384))>; 
+				reg = <0x00820000 (DT_SIZE_M(8) - DT_SIZE_K(128))>;
 			};
 		};
 	};
