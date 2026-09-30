@@ -9,6 +9,7 @@
 #include <ksched.h>
 #include <timeout_q.h>
 #include <zephyr/internal/syscall_handler.h>
+#include <zephyr/pm/dbg_pm_wake.h>
 #include <zephyr/drivers/timer/system_timer.h>
 #include <zephyr/sys_clock.h>
 #include <zephyr/llext/symbol.h>
@@ -85,6 +86,114 @@ static int32_t next_timeout(int32_t ticks_elapsed)
 	return ret;
 }
 
+__weak void badge_trace_timeout_add(int64_t ticks,
+				    uintptr_t fn,
+				    uintptr_t obj,
+				    uintptr_t caller)
+{
+	ARG_UNUSED(ticks);
+	ARG_UNUSED(fn);
+	ARG_UNUSED(obj);
+	ARG_UNUSED(caller);
+}
+
+k_ticks_t z_add_timeout(struct _timeout *to,
+			_timeout_func_t fn,
+			k_timeout_t timeout)
+{
+	k_ticks_t ticks = 0;
+
+	if (K_TIMEOUT_EQ(timeout, K_FOREVER)) {
+		return 0;
+	}
+
+#ifdef CONFIG_KERNEL_COHERENCE
+	__ASSERT_NO_MSG(sys_cache_is_mem_coherent(to));
+#endif
+
+	__ASSERT(!sys_dnode_is_linked(&to->node), "");
+	to->fn = fn;
+
+	/*
+	 * TEMPORARY DEBUG:
+	 *
+	 * Capture the ORIGINAL requested relative timeout.
+	 * At 10 kHz:
+	 *
+	 *      100 ticks = 10 ms
+	 *
+	 * Don't log here.
+	 */
+	if (Z_IS_TIMEOUT_RELATIVE(timeout) &&
+	    timeout.ticks >= 45 &&
+	    timeout.ticks <= 65) {
+
+		uintptr_t caller =
+			(uintptr_t)__builtin_extract_return_addr(
+				__builtin_return_address(0));
+
+		badge_trace_timeout_add(
+			(int64_t)timeout.ticks,
+			(uintptr_t)fn,
+			(uintptr_t)to,
+			caller);
+	}
+
+	K_SPINLOCK(&timeout_lock) {
+		struct _timeout *t;
+		int32_t ticks_elapsed;
+		bool has_elapsed = false;
+
+		if (Z_IS_TIMEOUT_RELATIVE(timeout)) {
+			ticks_elapsed = elapsed();
+			has_elapsed = true;
+
+			to->dticks =
+				timeout.ticks + 1 + ticks_elapsed;
+
+			ticks = curr_tick + to->dticks;
+		} else {
+			k_ticks_t dticks =
+				Z_TICK_ABS(timeout.ticks) -
+				curr_tick;
+
+			to->dticks = max(1, dticks);
+			ticks = timeout.ticks;
+		}
+
+		for (t = first(); t != NULL; t = next(t)) {
+			if (t->dticks > to->dticks) {
+				t->dticks -= to->dticks;
+				sys_dlist_insert(&t->node,
+						 &to->node);
+				break;
+			}
+
+			to->dticks -= t->dticks;
+		}
+
+		if (t == NULL) {
+			sys_dlist_append(&timeout_list,
+					 &to->node);
+		}
+
+		if (to == first() &&
+		    announce_remaining == 0) {
+
+			if (!has_elapsed) {
+				ticks_elapsed = elapsed();
+			}
+
+			sys_clock_set_timeout(
+				next_timeout(ticks_elapsed),
+				false);
+		}
+	}
+
+	return ticks;
+}
+
+#ifdef _THIS_IS_THE_ORIGINAL_CODE_
 k_ticks_t z_add_timeout(struct _timeout *to, _timeout_func_t fn, k_timeout_t timeout)
 {
 	k_ticks_t ticks = 0;
@@ -143,6 +252,7 @@ k_ticks_t z_add_timeout(struct _timeout *to, _timeout_func_t fn, k_timeout_t tim
 
 	return ticks;
 }
+#endif
 
 int z_abort_timeout(struct _timeout *to)
 {
@@ -222,6 +332,14 @@ int32_t z_get_next_timeout_expiry(void)
 
 void sys_clock_announce_locked(int32_t ticks, k_spinlock_key_t key)
 {
+    #ifdef CONFIG_PM
+    	if (dbg_pm_sti_armed) {
+    		dbg_pm_wake.sys_clock_wakes++;
+    		dbg_pm_wake.last_clock_ticks = ticks;
+    		dbg_pm_sti_armed = 0;
+    	}
+	#endif
+
 	/* We release the lock around the callbacks below, so on SMP
 	 * systems someone might be already running the loop.  Don't
 	 * race (which will cause parallel execution of "sequential"

@@ -15,6 +15,7 @@
 #include <zephyr/sys_clock.h>
 #include <zephyr/spinlock.h>
 #include <zephyr/drivers/counter.h>
+#include <zephyr/pm/dbg_pm_wake.h>
 #include <zephyr/pm/pm.h>
 #include <zephyr/drivers/reset.h>
 #include "fsl_ostimer.h"
@@ -75,6 +76,12 @@ static uint32_t mcux_os_timer_calc_elapsed_ticks(uint64_t current_cycles)
 void mcux_lpc_ostick_isr(const void *arg)
 {
 	ARG_UNUSED(arg);
+
+    #ifdef CONFIG_PM
+      if (dbg_pm_sti_armed) {
+        dbg_pm_wake.os_timer_irq_wakes++;
+      }	
+	#endif	
 
 	k_spinlock_key_t key = k_spin_lock(&lock);
 
@@ -244,12 +251,20 @@ bool z_nxp_os_timer_ignore_timer_wakeup(void)
 	return (wait_forever || counter_remaining_ticks);
 }
 
+__weak void badge_trace_sys_clock_timeout(int32_t ticks, bool idle)
+{
+	ARG_UNUSED(ticks);
+	ARG_UNUSED(idle);
+}
+
 void sys_clock_set_timeout(int32_t ticks, bool idle)
 {
 	if (!IS_ENABLED(CONFIG_TICKLESS_KERNEL)) {
 		/* Only for tickless kernel system */
 		return;
 	}
+
+	badge_trace_sys_clock_timeout(ticks, idle);
 
 #if DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(standby)) && CONFIG_PM
 	/* We intercept calls from idle with a 0 tick count when PM=y */

@@ -14,6 +14,7 @@
  * a parameter.
  */
 #include <zephyr/kernel.h>
+#include <zephyr/pm/dbg_pm_wake.h>
 #include <zephyr/irq.h>
 #include <zephyr/pm/pm.h>
 #include <cmsis_core.h>
@@ -30,54 +31,72 @@
  * perform the context switch itself.
  *
  */
+
+volatile uint32_t dbg_wake_irq_count[CONFIG_NUM_IRQS];
+volatile uint32_t dbg_wake_irq_total;
+volatile int32_t dbg_wake_irq_last = -1;
+ 
 void _isr_wrapper(void)
 {
+#ifdef CONFIG_PM
+	bool dbg_sti_external_candidate = false;
+	int32_t dbg_sti_candidate_irq = -1;
+#endif
+
 #ifdef CONFIG_TRACING_ISR
 	sys_trace_isr_enter();
-#endif /* CONFIG_TRACING_ISR */
+#endif
 
 #ifdef CONFIG_PM
-	/*
-	 * All non-ZLI interrupts are disabled when handling idle wakeup.  For
-	 * tickless idle, this ensures that the calculation and programming of
-	 * the device for the next timer deadline is not interrupted.  For
-	 * non-tickless idle, this ensures that the clearing of the kernel idle
-	 * state is not interrupted.  In each case, pm_system_resume is called
-	 * with non-ZLI interrupts disabled.
-	 */
-
-	/*
-	 * Disable non-ZLI interrupts to prevent nesting while exiting idle
-	 * state. This is only necessary for the Cortex-M because it is the only
-	 * ARM architecture variant that automatically enables interrupts when
-	 * entering an ISR.
-	 */
 	unsigned int key = arch_irq_lock();
 
-	/* is this a wakeup from idle ? */
-	/* requested idle duration, in ticks */
 	if (_kernel.idle != 0) {
-		/* clear kernel idle state */
+		uint32_t vector = __get_IPSR();
+
+		if (vector >= 16U) {
+			uint32_t irq = vector - 16U;
+
+			if (irq < CONFIG_NUM_IRQS) {
+				dbg_wake_irq_count[irq]++;
+				dbg_wake_irq_total++;
+				dbg_wake_irq_last = (int32_t)irq;
+			}
+
+			if (dbg_pm_sti_armed) {
+				dbg_sti_external_candidate = true;
+				dbg_sti_candidate_irq = (int32_t)irq;
+			}
+		}
+
 		_kernel.idle = 0;
 		pm_system_resume();
 	}
-	/* re-enable interrupts */
+
 	arch_irq_unlock(key);
-#endif /* CONFIG_PM */
+#endif
 
 #if defined(CONFIG_ARM_CUSTOM_INTERRUPT_CONTROLLER)
 	int32_t irq_number = z_soc_irq_get_active();
 #else
 	int32_t irq_number = __get_IPSR();
 #endif
-	/* _sw_isr_table does not map the core system exceptions,
-	 * which take first 16 interrupt numbers, only the external
-	 * interrupts.
-	 */
+
 	irq_number -= 16;
 
-	const struct _isr_table_entry *entry = &_sw_isr_table[irq_number];
+	const struct _isr_table_entry *entry =
+		&_sw_isr_table[irq_number];
+
 	(entry->isr)(entry->arg);
+
+#ifdef CONFIG_PM
+	if (dbg_sti_external_candidate && dbg_pm_sti_armed) {
+		dbg_pm_wake.external_irq_wakes++;
+		dbg_pm_wake.last_external_irq =
+			dbg_sti_candidate_irq;
+
+		dbg_pm_sti_armed = 0;
+	}
+#endif
 
 #if defined(CONFIG_ARM_CUSTOM_INTERRUPT_CONTROLLER)
 	z_soc_irq_eoi(irq_number);
@@ -85,7 +104,7 @@ void _isr_wrapper(void)
 
 #ifdef CONFIG_TRACING_ISR
 	sys_trace_isr_exit();
-#endif /* CONFIG_TRACING_ISR */
+#endif
 
 	z_arm_exc_exit();
 }

@@ -688,9 +688,31 @@ void z_thread_timeout(struct _timeout *timeout)
 }
 #endif /* CONFIG_SYS_CLOCK_EXISTS */
 
+__weak void badge_trace_thread_pend(struct k_thread *thread,
+				    int64_t ticks,
+				    uintptr_t caller) {
+	ARG_UNUSED(thread);
+	ARG_UNUSED(ticks);
+	ARG_UNUSED(caller);
+}
+
 int z_pend_curr(struct k_spinlock *lock, k_spinlock_key_t key,
 	       _wait_q_t *wait_q, k_timeout_t timeout)
 {
+	if (Z_IS_TIMEOUT_RELATIVE(timeout) &&
+	    timeout.ticks >= 95 &&
+	    timeout.ticks <= 105) {
+
+		uintptr_t caller =
+			(uintptr_t)__builtin_extract_return_addr(
+				__builtin_return_address(0));
+
+		badge_trace_thread_pend(
+			_current,
+			(int64_t)timeout.ticks,
+			caller);
+	}
+	
 #if defined(CONFIG_TIMESLICING) && defined(CONFIG_SWAP_NONATOMIC)
 	pending_current = _current;
 #endif /* CONFIG_TIMESLICING && CONFIG_SWAP_NONATOMIC */

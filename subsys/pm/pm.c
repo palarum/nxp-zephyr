@@ -10,6 +10,7 @@
 #include <zephyr/init.h>
 #include <string.h>
 #include <zephyr/drivers/timer/system_timer.h>
+#include <zephyr/pm/dbg_pm_wake.h>
 #include <zephyr/pm/device.h>
 #include <zephyr/pm/device_runtime.h>
 #include <zephyr/pm/pm.h>
@@ -152,23 +153,131 @@ bool pm_state_force(uint8_t cpu, const struct pm_state_info *info)
 	return true;
 }
 
+struct dbg_pm_sample {
+	uint32_t suspend_calls;
+
+	int32_t ticks_min;
+	int32_t ticks_max;
+
+	uint32_t ticks_lt_10;
+	uint32_t ticks_10_49;
+	uint32_t ticks_50_59;
+	uint32_t ticks_60_99;
+	uint32_t ticks_100_999;
+	uint32_t ticks_ge_1000;
+};
+
+volatile struct dbg_pm_sample dbg_pm_sample = {
+	.ticks_min = INT32_MAX,
+	.ticks_max = INT32_MIN,
+};
+
+struct dbg_pm_selected_sample {
+	uint32_t selected_runtime_idle;
+	uint32_t selected_suspend_idle;
+	uint32_t selected_other;
+	uint32_t selected_none;
+
+	uint32_t entered_runtime_idle;
+	uint32_t entered_suspend_idle;
+	uint32_t entered_other;
+
+	uint32_t suspend_idle_device_fail;
+
+	int32_t last_kernel_ticks;
+	int32_t last_events_ticks;
+	int32_t last_effective_ticks;
+
+	/* Raw kernel_ticks for actual suspend-to-idle entries */
+	uint32_t sti_kernel_forever;
+	uint32_t sti_kernel_lt_10;
+	uint32_t sti_kernel_10_49;
+	uint32_t sti_kernel_50_59;
+	uint32_t sti_kernel_60_99;
+	uint32_t sti_kernel_100_999;
+	uint32_t sti_kernel_ge_1000;
+
+	/* Effective ticks used by PM policy for actual suspend-to-idle entries */
+	uint32_t sti_effective_forever;
+	uint32_t sti_effective_lt_10;
+	uint32_t sti_effective_10_49;
+	uint32_t sti_effective_50_59;
+	uint32_t sti_effective_60_99;
+	uint32_t sti_effective_100_999;
+	uint32_t sti_effective_ge_1000;
+};
+
+volatile struct dbg_pm_selected_sample dbg_pm_selected;
+volatile struct dbg_pm_wake dbg_pm_wake;
+volatile uint32_t dbg_pm_sti_armed;
+
+void dbg_pm_reset_counters(void)
+{
+	memset((void *)&dbg_pm_wake,
+	       0,
+	       sizeof(dbg_pm_wake));
+
+	dbg_pm_wake.last_external_irq = -1;
+	dbg_pm_wake.last_clock_ticks = -1;
+
+	dbg_pm_sti_armed = 0;
+
+	memset((void *)&dbg_pm_selected,
+	       0,
+	       sizeof(dbg_pm_selected));
+
+	memset((void *)&dbg_pm_sample,
+	       0,
+	       sizeof(dbg_pm_sample));
+
+	dbg_pm_sample.ticks_min = INT32_MAX;
+	dbg_pm_sample.ticks_max = INT32_MIN;
+}
+
 bool pm_system_suspend(int32_t kernel_ticks)
 {
+	dbg_pm_sample.suspend_calls++;
+
+	if (kernel_ticks >= 0) {
+		if (kernel_ticks < dbg_pm_sample.ticks_min) {
+			dbg_pm_sample.ticks_min = kernel_ticks;
+		}
+
+		if (kernel_ticks > dbg_pm_sample.ticks_max) {
+			dbg_pm_sample.ticks_max = kernel_ticks;
+		}
+
+		if (kernel_ticks < 10) {
+			dbg_pm_sample.ticks_lt_10++;
+		} else if (kernel_ticks < 50) {
+			dbg_pm_sample.ticks_10_49++;
+		} else if (kernel_ticks < 60) {
+			dbg_pm_sample.ticks_50_59++;
+		} else if (kernel_ticks < 100) {
+			dbg_pm_sample.ticks_60_99++;
+		} else if (kernel_ticks < 1000) {
+			dbg_pm_sample.ticks_100_999++;
+		} else {
+			dbg_pm_sample.ticks_ge_1000++;
+		}
+	}
+
 	uint8_t id = CPU_ID;
 	k_spinlock_key_t key;
-	int32_t ticks, events_ticks;
+	int32_t ticks;
+	int32_t events_ticks;
 	uint32_t exit_latency_ticks;
 
 	SYS_PORT_TRACING_FUNC_ENTER(pm, system_suspend, kernel_ticks);
 
-	if (!pm_policy_state_any_active() && (z_cpus_pm_forced_state[id] == NULL)) {
-		/* Return early if all states are unavailable. */
+	if (!pm_policy_state_any_active() &&
+	    (z_cpus_pm_forced_state[id] == NULL)) {
+
 		return false;
 	}
 
 	/*
-	 * CPU needs to be fully wake up before the event is triggered.
-	 * We need to find out first the ticks to the next event
+	 * Determine time until the next event.
 	 */
 	events_ticks = pm_policy_next_event_ticks();
 	ticks = ticks_expiring_sooner(kernel_ticks, events_ticks);
@@ -177,87 +286,300 @@ bool pm_system_suspend(int32_t kernel_ticks)
 	int32_t custom_ticks = pm_policy_next_custom_ticks();
 
 	ticks = ticks_expiring_sooner(custom_ticks, ticks);
-#endif /* CONFIG_PM_CUSTOM_TICKS_HOOK */
+#endif
 
+	/*
+	 * Select the PM state.
+	 */
 	key = k_spin_lock(&pm_forced_state_lock);
+
 	if (z_cpus_pm_forced_state[id] != NULL) {
 		z_cpus_pm_state[id] = z_cpus_pm_forced_state[id];
 		z_cpus_pm_forced_state[id] = NULL;
 	} else {
 		z_cpus_pm_state[id] = pm_policy_next_state(id, ticks);
 	}
+
 	k_spin_unlock(&pm_forced_state_lock, key);
+
+	/*
+	 * Record policy inputs/result.
+	 */
+	dbg_pm_selected.last_kernel_ticks = kernel_ticks;
+	dbg_pm_selected.last_events_ticks = events_ticks;
+	dbg_pm_selected.last_effective_ticks = ticks;
+
+	if (z_cpus_pm_state[id] == NULL) {
+
+		dbg_pm_selected.selected_none++;
+
+	} else if (z_cpus_pm_state[id]->state == PM_STATE_RUNTIME_IDLE) {
+
+		dbg_pm_selected.selected_runtime_idle++;
+
+	} else if (z_cpus_pm_state[id]->state == PM_STATE_SUSPEND_TO_IDLE) {
+
+		dbg_pm_selected.selected_suspend_idle++;
+
+	} else {
+
+		dbg_pm_selected.selected_other++;
+	}
 
 	if (z_cpus_pm_state[id] == NULL) {
 		LOG_DBG("No PM operations done.");
-		SYS_PORT_TRACING_FUNC_EXIT(pm, system_suspend, ticks, PM_STATE_ACTIVE);
+
+		SYS_PORT_TRACING_FUNC_EXIT(pm,
+					   system_suspend,
+					   ticks,
+					   PM_STATE_ACTIVE);
+
 		return false;
 	}
 
 #ifdef CONFIG_PM_DEVICE_SYSTEM_MANAGED
 	if (atomic_sub(&_cpus_active, 1) == 1) {
+
 		if ((z_cpus_pm_state[id]->state != PM_STATE_RUNTIME_IDLE) &&
 		    !z_cpus_pm_state[id]->pm_device_disabled) {
+
 			if (!pm_suspend_devices()) {
+
+				if (z_cpus_pm_state[id]->state ==
+				    PM_STATE_SUSPEND_TO_IDLE) {
+
+					dbg_pm_selected.suspend_idle_device_fail++;
+				}
+
 				pm_resume_devices();
+
 				z_cpus_pm_state[id] = NULL;
+
 				(void)atomic_add(&_cpus_active, 1);
-				SYS_PORT_TRACING_FUNC_EXIT(pm, system_suspend, ticks,
+
+				SYS_PORT_TRACING_FUNC_EXIT(pm,
+							   system_suspend,
+							   ticks,
 							   PM_STATE_ACTIVE);
+
 				return false;
 			}
 		}
 	}
 #endif
 
-	exit_latency_ticks = EXIT_LATENCY_US_TO_TICKS(z_cpus_pm_state[id]->exit_latency_us);
-	if ((exit_latency_ticks > 0) && (ticks != K_TICKS_FOREVER)) {
-		/*
-		 * We need to set the timer to interrupt a little bit early to
-		 * accommodate the time required by the CPU to fully wake up.
-		 *
-		 * Since K_TICKS_FOREVER is defined as -1, ensure that -1
-		 * is not passed as the next timeout.
-		 *
-		 */
-		k_spinlock_key_t key = sys_clock_lock();
+	/*
+	 * Account for exit latency when programming the timer.
+	 */
+	exit_latency_ticks =
+		EXIT_LATENCY_US_TO_TICKS(
+			z_cpus_pm_state[id]->exit_latency_us);
 
-		sys_clock_set_timeout(MAX(0, (int64_t)ticks - (int64_t)exit_latency_ticks), true);
-		sys_clock_unlock(key);
+	if ((exit_latency_ticks > 0) &&
+	    (ticks != K_TICKS_FOREVER)) {
+
+		k_spinlock_key_t clock_key = sys_clock_lock();
+
+		sys_clock_set_timeout(
+			MAX(0,
+			    (int64_t)ticks -
+			    (int64_t)exit_latency_ticks),
+			true);
+
+		sys_clock_unlock(clock_key);
 	}
 
 	/*
-	 * This function runs with interruptions locked but it is
-	 * expected the SoC to unlock them in
-	 * pm_state_exit_post_ops() when returning to active
-	 * state. We don't want to be scheduled out yet, first we need
-	 * to send a notification about leaving the idle state. So,
-	 * we lock the scheduler here and unlock just after we have
-	 * sent the notification in pm_system_resume().
+	 * Prevent scheduling until the resume notification is complete.
 	 */
 	k_sched_lock();
 
 	if (IS_ENABLED(CONFIG_PM_STATS)) {
 		pm_stats_start();
 	}
-	/* Enter power state */
+
+	/*
+	 * Enter power state.
+	 */
 	pm_state_notify(true);
 	atomic_set_bit(z_post_ops_required, id);
-	pm_state_set(z_cpus_pm_state[id]->state, z_cpus_pm_state[id]->substate_id);
 
-	/* Wake up sequence starts here */
+	enum pm_state dbg_state =
+		z_cpus_pm_state[id]->state;
 
+	/*
+	 * Record the state which actually made it through
+	 * device PM and is about to be entered.
+	 */
+	if (dbg_state == PM_STATE_RUNTIME_IDLE) {
+
+		dbg_pm_selected.entered_runtime_idle++;
+
+	} else if (dbg_state == PM_STATE_SUSPEND_TO_IDLE) {
+
+		dbg_pm_selected.entered_suspend_idle++;
+
+		/*
+		 * Histogram of raw kernel_ticks.
+		 */
+		if (kernel_ticks == K_TICKS_FOREVER) {
+			dbg_pm_selected.sti_kernel_forever++;
+
+		} else if (kernel_ticks < 10) {
+			dbg_pm_selected.sti_kernel_lt_10++;
+
+		} else if (kernel_ticks < 50) {
+			dbg_pm_selected.sti_kernel_10_49++;
+
+		} else if (kernel_ticks < 60) {
+			dbg_pm_selected.sti_kernel_50_59++;
+
+		} else if (kernel_ticks < 100) {
+			dbg_pm_selected.sti_kernel_60_99++;
+
+		} else if (kernel_ticks < 1000) {
+			dbg_pm_selected.sti_kernel_100_999++;
+
+		} else {
+			dbg_pm_selected.sti_kernel_ge_1000++;
+		}
+
+		/*
+		 * Histogram of effective ticks actually presented
+		 * to the PM policy.
+		 */
+		if (ticks == K_TICKS_FOREVER) {
+			dbg_pm_selected.sti_effective_forever++;
+
+		} else if (ticks < 10) {
+			dbg_pm_selected.sti_effective_lt_10++;
+
+		} else if (ticks < 50) {
+			dbg_pm_selected.sti_effective_10_49++;
+
+		} else if (ticks < 60) {
+			dbg_pm_selected.sti_effective_50_59++;
+
+		} else if (ticks < 100) {
+			dbg_pm_selected.sti_effective_60_99++;
+
+		} else if (ticks < 1000) {
+			dbg_pm_selected.sti_effective_100_999++;
+
+		} else {
+			dbg_pm_selected.sti_effective_ge_1000++;
+		}
+
+	} else {
+
+		dbg_pm_selected.entered_other++;
+	}
+
+	/*
+	 * Arm wake attribution immediately before entering
+	 * suspend-to-idle.
+	 */
+	bool dbg_is_sti =
+		(dbg_state == PM_STATE_SUSPEND_TO_IDLE);
+
+    if (dbg_is_sti) {
+    	dbg_pm_wake.last_external_irq = -1;
+    	dbg_pm_wake.last_clock_ticks = -1;
+    
+    	dbg_pm_sti_armed = 1;
+    }
+
+	/*
+	 * Actually enter the selected power state.
+	 *
+	 * Execution resumes here after the hardware wakes.
+	 */
+	pm_state_set(z_cpus_pm_state[id]->state,
+		     z_cpus_pm_state[id]->substate_id);
+
+    /*
+     * We are now immediately after the hardware wake.
+     *
+     * Interrupts may not have been serviced yet, so inspect
+     * Cortex-M pending state here. Do NOT clear
+     * dbg_pm_sti_armed here.
+     */
+    if (dbg_is_sti) {
+    	uint32_t icsr = SCB->ICSR;
+    
+    	uint32_t vector =
+    		(icsr & SCB_ICSR_VECTPENDING_Msk) >>
+    		SCB_ICSR_VECTPENDING_Pos;
+    
+    	dbg_pm_wake.sti_exits++;
+    
+    	dbg_pm_wake.last_icsr = icsr;
+    	dbg_pm_wake.last_vector = vector;
+    
+    	/*
+    	 * Cortex-M exception numbers:
+    	 *
+    	 *  0     = nothing pending
+    	 * 14     = PendSV
+    	 * 15     = SysTick
+    	 * 16+    = external NVIC IRQ
+    	 */
+    	if (vector == 0U) {
+    		dbg_pm_wake.vectpending_none++;
+    
+    	} else if (vector == 15U) {
+    		dbg_pm_wake.vectpending_systick++;
+    
+    	} else if (vector == 14U) {
+    		dbg_pm_wake.vectpending_pendsv++;
+    
+    	} else if (vector >= 16U) {
+    		dbg_pm_wake.vectpending_external++;
+    
+    		/*
+    		 * This is only the VECTPENDING observation.
+    		 * It is okay to record it here.
+    		 */
+    		dbg_pm_wake.last_external_irq =
+    			(int32_t)(vector - 16U);
+    
+    	} else {
+    		dbg_pm_wake.vectpending_other++;
+    	}
+    
+    	if ((icsr & SCB_ICSR_PENDSTSET_Msk) != 0U) {
+    		dbg_pm_wake.systick_pending_bit++;
+    	}
+    
+    	if ((icsr & SCB_ICSR_ISRPENDING_Msk) != 0U) {
+    		dbg_pm_wake.external_pending_bit++;
+    	}
+    }	
+
+	/*
+	 * Wake-up sequence starts here.
+	 */
 	if (IS_ENABLED(CONFIG_PM_STATS)) {
+
 		pm_stats_stop();
-		pm_stats_update(z_cpus_pm_state[id] ?
-				z_cpus_pm_state[id]->state : PM_STATE_ACTIVE);
+
+		pm_stats_update(
+			z_cpus_pm_state[id] ?
+			z_cpus_pm_state[id]->state :
+			PM_STATE_ACTIVE);
 	}
 
 	pm_system_resume();
+
 	k_sched_unlock();
-	SYS_PORT_TRACING_FUNC_EXIT(pm, system_suspend, ticks,
-				   z_cpus_pm_state[id] ?
-				   z_cpus_pm_state[id]->state : PM_STATE_ACTIVE);
+
+	SYS_PORT_TRACING_FUNC_EXIT(
+		pm,
+		system_suspend,
+		ticks,
+		z_cpus_pm_state[id] ?
+			z_cpus_pm_state[id]->state :
+			PM_STATE_ACTIVE);
 
 	return true;
 }
